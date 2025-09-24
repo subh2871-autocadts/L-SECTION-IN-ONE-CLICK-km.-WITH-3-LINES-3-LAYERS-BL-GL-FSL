@@ -1,0 +1,518 @@
+' -------------------------
+' Combined Excel -> AutoCAD Module (layers + layer assignment)
+' -------------------------
+Option Explicit
+
+' Module-level storage so workers can share the Worker1 selection/headers
+Public Worker1DataRange As Range
+Public Worker1HeaderArr As Variant
+Public Worker1BasePoint As Variant    ' store the AutoCAD click (base point) from Worker1
+
+' Module-level storage for remembering last-used values (session)
+Public LastHScale As Double
+Public LastVScale As Double
+Public LastTxtHeight As Double
+Public LastTxtGap As Double
+Public LastDatum As Double
+Public LastHdrTxtHeight As Double ' header text height remembered
+
+' -------------------------
+' Helper: AutoCAD connection (late binding)
+' -------------------------
+Function GetAcadApp() As Object
+    On Error Resume Next
+    Set GetAcadApp = GetObject(, "AutoCAD.Application")
+    If GetAcadApp Is Nothing Then
+        Set GetAcadApp = CreateObject("AutoCAD.Application")
+    End If
+    On Error GoTo 0
+End Function
+
+' -------------------------
+' Helper: safe numeric input (returns CVErr if user cancels)
+' -------------------------
+Function SafeNumInput(prompt As String, title As String, defaultVal As Double) As Variant
+    Dim v As Variant
+    v = Application.InputBox(prompt, title, defaultVal, Type:=1)
+    If TypeName(v) = "Boolean" Then ' user pressed Cancel
+        SafeNumInput = CVErr(xlErrNA)
+        Exit Function
+    End If
+    If IsNumeric(v) Then
+        SafeNumInput = CDbl(v)
+    Else
+        SafeNumInput = CVErr(xlErrValue)
+    End If
+End Function
+
+' -------------------------
+' Helper: safe range input
+' -------------------------
+Function SafeRangeInput(prompt As String) As Range
+    Dim r As Range
+    On Error Resume Next
+    Set r = Application.InputBox(prompt, "Select Range", Type:=8)
+    On Error GoTo 0
+    Set SafeRangeInput = r
+End Function
+
+' -------------------------
+' Helper: format cell to text (numeric => formatted, else string)
+' -------------------------
+Function CellToTxt(c As Range) As String
+    If c Is Nothing Then
+        CellToTxt = ""
+    ElseIf Trim$(CStr(c.Value)) = "" Then
+        CellToTxt = ""
+    ElseIf IsNumeric(c.Value) Then
+        CellToTxt = Format(c.Value, "0.000")
+    Else
+        CellToTxt = CStr(c.Value)
+    End If
+End Function
+
+' -------------------------
+' Helper: create/get layer (returns Layer object)
+' - colorIndex should be ACI index (1=red,3=green,5=blue,7=white etc.)
+' -------------------------
+Function GetOrCreateLayer(acadDoc As Object, layerName As String, colorIndex As Long) As Object
+    Dim lay As Object
+    On Error Resume Next
+    Set lay = acadDoc.Layers.Item(layerName)
+    If lay Is Nothing Then
+        Set lay = acadDoc.Layers.Add(layerName)
+        On Error Resume Next
+        lay.Color = colorIndex
+        On Error GoTo 0
+    Else
+        ' if exists, try to set color to requested (non-destructive)
+        On Error Resume Next
+        lay.Color = colorIndex
+        On Error GoTo 0
+    End If
+    Set GetOrCreateLayer = lay
+End Function
+
+' -------------------------
+' Helper: map color index to layer name (for our three colours)
+' -------------------------
+Function LayerNameForColorIndex(colorIndex As Long) As String
+    Select Case colorIndex
+        Case 1
+            LayerNameForColorIndex = "BED LEVEL"
+        Case 3
+            LayerNameForColorIndex = "GROUND LEVEL"
+        Case 5
+            LayerNameForColorIndex = "FSL"
+        Case Else
+            LayerNameForColorIndex = "" ' no mapping
+    End Select
+End Function
+
+' ============================================
+' Show start instruction
+' ============================================
+Sub ShowStartInstruction()
+    Dim s As String
+    s = "L - Instructions for drawing section" & vbCrLf & vbCrLf & _
+        "Select the all data with heading (eg. change, bed level, ground level ...)." & vbCrLf & _
+        "Click on AutoCAD to write then click to write header then click on DATUM to draw line then select the data for positioning of PUCCA works and click on AutoCAD." & vbCrLf & vbCrLf & _
+        "Press OK to start."
+    MsgBox s, vbInformation, "Instruction"
+End Sub
+
+' ============================================
+' Worker 1: WriteColumnTexts (FIRST ROW IS HEADER)
+' - Places column-based colored texts, saves header and data-range and stores clicked base point
+' ============================================
+Sub Worker_WriteColumnTexts(acadDoc As Object, hScale As Double, vScale As Double, txtHeight As Double, txtGap As Double, datumY As Double)
+    On Error GoTo EH
+    Dim selRange As Range, rowRange As Range
+    Dim r As Long, rowCount As Long, colCount As Long
+    Dim colIndex As Long, offsetIndex As Long
+    Dim xRaw As Double, xVal As Double
+    Dim basePoint As Variant
+    Dim txtObj As Object
+    Dim insPt(0 To 2) As Double
+    Dim txtVal As String
+    Dim objLayerName As String
+
+    Set selRange = SafeRangeInput("Select range (First row = HEADING, Second row onwards = data) for Worker 1:")
+    If selRange Is Nothing Then Exit Sub
+
+    Set Worker1DataRange = selRange
+    Worker1HeaderArr = selRange.Rows(1).Value
+
+    basePoint = acadDoc.Utility.GetPoint(, "Select base point in AutoCAD for Worker 1:")
+    If IsEmpty(basepoint) Then Exit Sub
+    Worker1BasePoint = basePoint
+
+    rowCount = selRange.Rows.Count
+    colCount = selRange.Columns.Count
+
+    For r = 2 To rowCount
+        Set rowRange = selRange.Rows(r)
+        If Len(Trim$(CStr(rowRange.Cells(1, 1).Value))) <> 0 And IsNumeric(rowRange.Cells(1, 1).Value) Then
+            xRaw = CDbl(rowRange.Cells(1, 1).Value)
+            xVal = Round(xRaw * hScale, 3)
+            For colIndex = colCount To 1 Step -1
+                txtVal = CellToTxt(rowRange.Cells(1, colIndex))
+                offsetIndex = colCount - colIndex
+                insPt(0) = Worker1BasePoint(0) + xVal
+                insPt(1) = Worker1BasePoint(1) - txtGap - (offsetIndex * txtGap)
+                insPt(2) = 0
+
+                Set txtObj = acadDoc.ModelSpace.AddText(txtVal, insPt, txtHeight)
+                On Error Resume Next
+                txtObj.StyleName = acadDoc.ActiveTextStyle.Name
+                txtObj.Rotation = WorksheetFunction.Radians(90)
+                txtObj.Alignment = 4
+                txtObj.TextAlignmentPoint = insPt
+
+                ' --- COLOR assignment per column ---
+                Select Case colIndex
+                    Case 1
+                        txtObj.Color = 7
+                    Case 2
+                        txtObj.Color = 1 ' red
+                    Case 3
+                        txtObj.Color = 3 ' green
+                    Case 4
+                        txtObj.Color = 5 ' blue
+                    Case Else
+                        txtObj.Color = 7
+                End Select
+
+                ' set layer if colour maps to a named layer
+                objLayerName = LayerNameForColorIndex(txtObj.Color)
+                If objLayerName <> "" Then
+                    On Error Resume Next
+                    Call GetOrCreateLayer(acadDoc, objLayerName, txtObj.Color)
+                    txtObj.Layer = objLayerName
+                    On Error GoTo EH
+                End If
+
+                txtObj.Update
+                On Error GoTo EH
+            Next colIndex
+        End If
+    Next r
+    Exit Sub
+EH:
+    MsgBox "Error in Worker_WriteColumnTexts: " & Err.Description, vbExclamation
+End Sub
+
+' ============================================
+' Worker 2: RightJustifyText
+' - writes starting from LAST header column downward using Worker1BasePoint and txtGap
+' - shifts left 100 units and uses hdrTxtHeight, assigns layer based on color mapping
+' ============================================
+Sub Worker_RightJustifyText(acadDoc As Object, hScale As Double, vScale As Double, txtHeight As Double, txtGap As Double, datumY As Double, hdrTxtHeight As Double)
+    On Error GoTo EH
+    Dim insPt(0 To 2) As Double
+    Dim i As Long, j As Long, hdrCount As Long, colIndex As Long
+    Dim hdrText As String
+    Dim txtObj As Object
+    Dim objLayerName As String
+
+    If Worker1DataRange Is Nothing Then Exit Sub
+    If IsEmpty(Worker1BasePoint) Then Exit Sub
+
+    hdrCount = UBound(Worker1HeaderArr, 2)
+    If hdrCount < 1 Then Exit Sub
+
+    i = 0
+    For j = hdrCount To 1 Step -1
+        hdrText = CStr(Worker1HeaderArr(1, j))
+        If Trim(hdrText) <> "" Then
+            insPt(0) = Worker1BasePoint(0) - 100
+            insPt(1) = Worker1BasePoint(1) - txtGap - (i * txtGap)
+            insPt(2) = 0
+            Set txtObj = acadDoc.ModelSpace.AddText(hdrText, insPt, hdrTxtHeight)
+            On Error Resume Next
+            txtObj.Alignment = 2
+            txtObj.TextAlignmentPoint = insPt
+
+            ' color mapping based on header original column index
+            colIndex = j
+            Select Case colIndex
+                Case 1: txtObj.Color = 7
+                Case 2: txtObj.Color = 1
+                Case 3: txtObj.Color = 3
+                Case 4: txtObj.Color = 5
+                Case Else: txtObj.Color = 7
+            End Select
+
+            ' set layer if mapping exists
+            objLayerName = LayerNameForColorIndex(txtObj.Color)
+            If objLayerName <> "" Then
+                On Error Resume Next
+                Call GetOrCreateLayer(acadDoc, objLayerName, txtObj.Color)
+                txtObj.Layer = objLayerName
+                On Error GoTo EH
+            End If
+
+            txtObj.Update
+            On Error GoTo EH
+            i = i + 1
+        End If
+    Next j
+    Exit Sub
+EH:
+    MsgBox "Error in Worker_RightJustifyText: " & Err.Description, vbExclamation
+End Sub
+
+' ============================================
+' Worker 3: MultiPolylines
+' - creates polylines (columns 2..4) and assigns color and layer
+' ============================================
+Sub Worker_MultiPolylines(acadDoc As Object, hScale As Double, vScale As Double, txtHeight As Double, txtGap As Double, datumY As Double)
+    On Error GoTo EH
+    Dim rowCount As Long, colCount As Long, dataRowCount As Long
+    Dim insPt As Variant, selRange As Range
+    Dim polyPoints() As Double, pointIndex As Long
+    Dim plineObj As Object, txtObj As Object
+    Dim i As Long, j As Long
+    Dim xVal As Double, yVal As Double
+    Dim colorCodes As Variant
+    Dim datumText As String
+    Dim objLayerName As String
+
+    If Worker1DataRange Is Nothing Then Exit Sub
+    rowCount = Worker1DataRange.Rows.Count
+    colCount = Worker1DataRange.Columns.Count
+    If rowCount < 2 Or colCount < 2 Then Exit Sub
+
+    Set selRange = Worker1DataRange.Resize(rowCount - 1).Offset(1, 0)
+    Set selRange = selRange.Resize(selRange.Rows.Count, Application.Min(4, colCount))
+
+    If IsEmpty(Worker1BasePoint) Then Exit Sub
+    insPt = Worker1BasePoint
+
+    On Error Resume Next
+    datumText = "DATUM " & CStr(datumY)
+    Set txtObj = acadDoc.ModelSpace.AddText(datumText, insPt, txtHeight)
+    If Not txtObj Is Nothing Then
+        txtObj.Alignment = 2
+        txtObj.TextAlignmentPoint = insPt
+        txtObj.Update
+    End If
+    On Error GoTo EH
+
+    colorCodes = Array(1, 3, 5) ' red, green, blue
+    dataRowCount = selRange.Rows.Count
+
+    For j = 2 To selRange.Columns.Count
+        ReDim polyPoints(0 To (dataRowCount * 3) - 1)
+        pointIndex = 0
+        For i = 1 To dataRowCount
+            xVal = Val(selRange.Cells(i, 1).Value)
+            yVal = Val(selRange.Cells(i, j).Value)
+            xVal = xVal * hScale
+            yVal = (yVal - CDbl(datumY)) * vScale
+            polyPoints(pointIndex) = insPt(0) + xVal
+            polyPoints(pointIndex + 1) = insPt(1) + yVal
+            polyPoints(pointIndex + 2) = insPt(2)
+            pointIndex = pointIndex + 3
+        Next i
+        On Error Resume Next
+        Set plineObj = acadDoc.ModelSpace.AddPolyline(polyPoints)
+        If Not plineObj Is Nothing Then
+            plineObj.Closed = False
+            plineObj.Color = colorCodes((j - 2) Mod 3)
+            ' set layer corresponding to color
+            objLayerName = LayerNameForColorIndex(plineObj.Color)
+            If objLayerName <> "" Then
+                Call GetOrCreateLayer(acadDoc, objLayerName, plineObj.Color)
+                plineObj.Layer = objLayerName
+            End If
+            plineObj.Update
+        End If
+        On Error GoTo EH
+    Next j
+
+    acadDoc.Regen 0
+    Exit Sub
+EH:
+    MsgBox "Error in Worker_MultiPolylines: " & Err.Description, vbExclamation
+End Sub
+
+' ============================================
+' Worker 4: PolylinesAndTexts (UPDATED to LWPolyline)
+' - Segment-1: 50 units, width 0 -> 30
+' - Segment-2: 500 units vertical, width 0 -> 0
+' - Segment-3: 500 units @ 60°, width 0 -> 0
+' ============================================
+Sub Worker_PolylinesAndTexts(acadDoc As Object, hScale As Double, vScale As Double, txtHeight As Double, txtGap As Double, datumY As Double)
+    On Error GoTo EH
+    Dim selRange As Range, cell As Range
+    Dim basePoint As Variant, textOrigin As Variant
+    Dim xRaw As Double, xScaled As Double
+    Dim pts() As Double
+    Dim lwObj As Object, txtObj As Object
+    Dim txtVal As String
+    Dim colIndex As Long
+    Dim angleRad As Double
+    Const SEG_LEN As Double = 500#
+    Const PI As Double = 3.14159265358979
+    Dim shortLen As Double, arrowWidth As Double
+
+    Set selRange = SafeRangeInput("Select range (First column = X, remaining columns = text) for Worker 4:")
+    If selRange Is Nothing Then Exit Sub
+
+    basePoint = acadDoc.Utility.GetPoint(, "Select base point in AutoCAD (this will be treated as 0,0 for polylines):")
+    If IsEmpty(basePoint) Then Exit Sub
+
+    ' exact requested values
+    shortLen = 50
+    arrowWidth = 30
+    angleRad = 60# * PI / 180#
+
+    ' For each X create LWPolyline with 4 vertices (x,y pairs)
+    For Each cell In selRange.Columns(1).Cells
+        If Trim(CStr(cell.Value)) <> "" And IsNumeric(cell.Value) Then
+            xRaw = CDbl(cell.Value)
+            xScaled = Round(xRaw * hScale, 6)
+
+            ' prepare 2D coords array for LWPolyline: x1,y1, x2,y2, x3,y3, x4,y4
+            ReDim pts(0 To 7)
+            ' P0
+            pts(0) = basePoint(0) + xScaled
+            pts(1) = basePoint(1)
+            ' P1 = P0 + shortLen vertically
+            pts(2) = pts(0)
+            pts(3) = pts(1) + shortLen
+            ' P2 = P1 + SEG_LEN vertically
+            pts(4) = pts(0)
+            pts(5) = pts(3) + SEG_LEN
+            ' P3 = from P2 go SEG_LEN at angle 60°
+            pts(6) = pts(4) + SEG_LEN * Cos(angleRad)
+            pts(7) = pts(5) + SEG_LEN * Sin(angleRad)
+
+            On Error Resume Next
+            Set lwObj = acadDoc.ModelSpace.AddLightWeightPolyline(pts)
+            On Error GoTo EH
+            If Not lwObj Is Nothing Then
+                lwObj.Closed = False
+                ' Set widths per segment (index starts at 0)
+                On Error Resume Next
+                lwObj.SetWidth 0, 0, arrowWidth   ' P0->P1 : 0 -> arrowWidth
+                lwObj.SetWidth 1, 0, 0            ' P1->P2 : 0 -> 0
+                lwObj.SetWidth 2, 0, 0            ' P2->P3 : 0 -> 0
+                On Error GoTo EH
+                lwObj.Update
+            End If
+        End If
+    Next cell
+
+    ' Now create texts (origin picked by user)
+    textOrigin = acadDoc.Utility.GetPoint(, "Select a point in AutoCAD — this point will be the ORIGIN (0,0) for all texts:")
+    If IsEmpty(textOrigin) Then Exit Sub
+
+    For Each cell In selRange.Columns(1).Cells
+        If Trim(CStr(cell.Value)) <> "" Then
+            If IsNumeric(cell.Value) Then
+                xRaw = CDbl(cell.Value)
+                xScaled = Round(xRaw * hScale, 6)
+            Else
+                xScaled = 0
+            End If
+            txtVal = ""
+            For colIndex = 2 To selRange.Columns.Count
+                If Trim$(CStr(cell.Offset(0, colIndex - 1).Value)) <> "" Then
+                    On Error Resume Next
+                    txtVal = txtVal & CStr(cell.Offset(0, colIndex - 1).Text) & " "
+                    If Err.Number <> 0 Then
+                        Err.Clear
+                        txtVal = txtVal & CellToTxt(cell.Offset(0, colIndex - 1)) & " "
+                    End If
+                    On Error GoTo EH
+                End If
+            Next colIndex
+            txtVal = Trim(txtVal)
+            If txtVal <> "" Then
+                Dim insTxt(0 To 2) As Double
+                insTxt(0) = textOrigin(0) + xScaled
+                insTxt(1) = textOrigin(1)
+                insTxt(2) = 0
+                On Error Resume Next
+                Set txtObj = acadDoc.ModelSpace.AddText(txtVal, insTxt, txtHeight)
+                If Not txtObj Is Nothing Then
+                    txtObj.StyleName = acadDoc.ActiveTextStyle.Name
+                    txtObj.Rotation = angleRad
+                End If
+                On Error GoTo EH
+            End If
+        End If
+    Next cell
+
+    acadDoc.Regen 0
+    MsgBox "Worker 4 complete: LWPolylines and texts placed.", vbInformation
+    Exit Sub
+EH:
+    MsgBox "Error in Worker_PolylinesAndTexts: " & Err.Description, vbExclamation
+End Sub
+
+' ============================================
+' Controller
+' ============================================
+Sub CombinedController()
+    Dim acadApp As Object, acadDoc As Object
+    Dim hScaleVar As Variant, vScaleVar As Variant, txtHeightVar As Variant
+    Dim txtGapVar As Variant, datumVar As Variant, hdrHeightVar As Variant
+    Dim hScale As Double, vScale As Double, txtHeight As Double
+    Dim txtGap As Double, datumY As Double, hdrTxtHeight As Double
+
+    ShowStartInstruction
+
+    hScaleVar = SafeNumInput("Enter horizontal scale factor (e.g. 1):", "Horizontal Scale", IIf(LastHScale = 0, 1, LastHScale))
+    If IsError(hScaleVar) Then Exit Sub
+    vScaleVar = SafeNumInput("Enter vertical scale factor (e.g. 1):", "Vertical Scale", IIf(LastVScale = 0, 1, LastVScale))
+    If IsError(vScaleVar) Then Exit Sub
+    txtHeightVar = SafeNumInput("Enter text height to use in AutoCAD (units):", "Text Height", IIf(LastTxtHeight = 0, 2, LastTxtHeight))
+    If IsError(txtHeightVar) Then Exit Sub
+    txtGapVar = SafeNumInput("Enter text gapping value (units):", "Text Gap", IIf(LastTxtGap = 0, 300, LastTxtGap))
+    If IsError(txtGapVar) Then Exit Sub
+    hdrHeightVar = SafeNumInput("Enter HEADER text height (units):", "Header Text Height", IIf(LastHdrTxtHeight = 0, 2, LastHdrTxtHeight))
+    If IsError(hdrHeightVar) Then Exit Sub
+    datumVar = SafeNumInput("Enter DATUM value (this will be used to subtract from Y values):", "Datum Value", LastDatum)
+    If IsError(datumVar) Then Exit Sub
+
+    hScale = CDbl(hScaleVar)
+    vScale = CDbl(vScaleVar)
+    txtHeight = CDbl(txtHeightVar)
+    txtGap = CDbl(txtGapVar)
+    hdrTxtHeight = CDbl(hdrHeightVar)
+    datumY = CDbl(datumVar)
+
+    LastHScale = hScale
+    LastVScale = vScale
+    LastTxtHeight = txtHeight
+    LastTxtGap = txtGap
+    LastHdrTxtHeight = hdrTxtHeight
+    LastDatum = datumY
+
+    Set acadApp = GetAcadApp
+    If acadApp Is Nothing Then
+        MsgBox "AutoCAD not available. Please start AutoCAD and run again.", vbExclamation
+        Exit Sub
+    End If
+    acadApp.Visible = True
+    Set acadDoc = acadApp.ActiveDocument
+
+    ' Ensure required layers exist with desired colors
+    Call GetOrCreateLayer(acadDoc, "BED LEVEL", 1)    ' red
+    Call GetOrCreateLayer(acadDoc, "GROUND LEVEL", 3) ' green
+    Call GetOrCreateLayer(acadDoc, "FSL", 5)          ' blue
+
+    Worker_WriteColumnTexts acadDoc, hScale, vScale, txtHeight, txtGap, datumY
+    DoEvents
+    Worker_RightJustifyText acadDoc, hScale, vScale, txtHeight, txtGap, datumY, hdrTxtHeight
+    DoEvents
+    Worker_MultiPolylines acadDoc, hScale, vScale, txtHeight, txtGap, datumY
+    DoEvents
+    Worker_PolylinesAndTexts acadDoc, hScale, vScale, txtHeight, txtGap, datumY
+    DoEvents
+
+    MsgBox "CREATED BY SUBHASH CHANDRA", vbInformation
+End Sub
